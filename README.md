@@ -1,0 +1,129 @@
+# 红外-可见光视频配准流程
+
+本项目用于处理成对的红外视频和可见光视频。流程包括：同步抽帧、将可见光图像 resize 到红外分辨率 `640x512`、运行 RIFT 多模态配准、输出 warp 后的可见光图像和配准效果预览图。
+
+## 目录结构准备
+
+每一组视频数据建议单独放在一个目录中，目录内至少包含一个红外视频和一个可见光视频。默认情况下，总控脚本会自动识别文件名中包含 `infrared` 和 `visible` 的视频。
+
+```text
+I-R-Reg/
+├── data/
+│   └── video_data_20260521/
+│       ├── infrared_20260521_204552.mp4
+│       ├── visible_20260521_204552.mp4
+│       ├── frames/
+│       │   ├── infrared/
+│       │   └── visible/
+│       └── rift_registration/
+│           ├── warped_rgb/
+│           ├── preview/
+│           └── homographies.csv
+├── RIFT-Multimodal-matching-python/
+├── scripts/
+│   ├── extract_video_frames.py
+│   ├── register_frames_rift.py
+│   └── run_video_rift_pipeline.py
+└── TWMM/
+```
+
+其中 `frames/` 和 `rift_registration/` 是运行脚本后生成的目录，不需要手动创建。
+
+## 使用 uv 管理环境
+
+创建并激活虚拟环境：
+
+```bash
+uv venv .venv --python 3.10
+source .venv/bin/activate
+```
+
+安装当前流程需要的 Python 包：
+
+```bash
+uv pip install --python .venv/bin/python \
+  opencv-python numpy scipy joblib PyYAML tqdm
+```
+
+如果 uv 默认缓存目录没有写权限，可以使用项目内缓存：
+
+```bash
+UV_CACHE_DIR=.uv-cache uv pip install --python .venv/bin/python \
+  opencv-python numpy scipy joblib PyYAML tqdm
+```
+
+当前已使用的主要依赖版本：
+
+```text
+opencv-python==4.13.0
+numpy==2.2.6
+scipy==1.15.3
+joblib==1.5.3
+PyYAML==6.0.3
+tqdm==4.67.3
+```
+
+导出当前环境依赖：
+
+```bash
+UV_CACHE_DIR=.uv-cache uv pip freeze --python .venv/bin/python > requirements.txt
+```
+
+## 运行总控脚本
+
+推荐使用总控脚本完成“视频抽帧 + RIFT 配准”的完整流程。
+
+先处理 1 对图片做快速验证：
+
+```bash
+.venv/bin/python scripts/run_video_rift_pipeline.py data/video_data_20260521 --max-pairs 1
+```
+
+确认效果后，处理全部帧对：
+
+```bash
+.venv/bin/python scripts/run_video_rift_pipeline.py data/video_data_20260521 --max-pairs 0
+```
+
+常用参数：
+
+```bash
+--step 10                  # 每 10 帧抽取 1 张图片
+--overwrite                # 覆盖已有抽帧和配准结果，强制重新计算
+--skip-extract             # 跳过抽帧，只运行配准
+--skip-register            # 只抽帧，不运行配准
+--frames-dir PATH          # 指定抽帧输出目录
+--registration-dir PATH    # 指定配准结果输出目录
+--infrared-name FILE       # 手动指定红外视频文件名
+--visible-name FILE        # 手动指定可见光视频文件名
+```
+
+如果视频文件名不能被自动识别，可以显式指定：
+
+```bash
+.venv/bin/python scripts/run_video_rift_pipeline.py /path/to/video_batch \
+  --infrared-name infrared.mp4 \
+  --visible-name visible.mp4 \
+  --frames-dir /path/to/frames \
+  --registration-dir /path/to/rift_output \
+  --max-pairs 0
+```
+
+## 输出结果
+
+抽帧结果：
+
+```text
+frames/infrared/infrared_000000.jpg
+frames/visible/visible_000000.jpg
+```
+
+RIFT 配准结果：
+
+```text
+rift_registration/warped_rgb/visible_warped_000000.jpg
+rift_registration/preview/preview_000000.jpg
+rift_registration/homographies.csv
+```
+
+`warped_rgb/` 中保存的是 warp 到红外坐标系下的可见光 RGB 图像。`preview/` 中保存的是 2x2 配准效果图，包含 overlay、棋盘格、warp 后可见光图和红外原图。`homographies.csv` 记录每帧的状态、匹配点数、内点数和可见光到红外的单应性矩阵。
