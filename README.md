@@ -99,6 +99,7 @@ UV_CACHE_DIR=.uv-cache uv pip freeze --python .venv/bin/python > requirements.tx
 --overwrite                # 覆盖已有抽帧和配准结果，强制重新计算
 --skip-extract             # 跳过抽帧，继续去畸变和配准
 --skip-register            # 只抽帧和去畸变，不运行配准
+--no-fallback-h            # 关闭失败帧复用最近成功 H 的默认策略
 --frames-dir PATH          # 指定抽帧输出目录
 --undistorted-frames-dir PATH # 指定去畸变输出目录
 --registration-dir PATH    # 指定配准结果输出目录
@@ -144,4 +145,6 @@ rift_registration/preview/preview_000000.jpg
 rift_registration/homographies.csv
 ```
 
-总控脚本默认使用 `frames_undistorted/` 作为 RIFT 配准输入。`warped_rgb/` 中保存的是 warp 到红外坐标系下的可见光 RGB 图像。`preview/` 中保存的是 2x2 配准效果图，包含 overlay、棋盘格、warp 后可见光图和红外原图。`homographies.csv` 记录每帧的状态、匹配点数、内点数和可见光到红外的单应性矩阵。
+总控脚本默认使用 `frames_undistorted/` 作为 RIFT 配准输入。`warped_rgb/` 中保存的是 warp 到红外坐标系下的可见光 RGB 图像。`preview/` 中保存的是 2x2 配准效果图，包含 overlay、棋盘格、warp 后可见光图和红外原图。`homographies.csv` 记录每帧的状态、匹配点数、内点数和实际用于输出的可见光到红外单应性矩阵。
+
+配准阶段默认启用质量门控回退策略：如果当前帧匹配不足、单应性估计失败或 H 未通过质量门控，会复用当前帧之前最近一次 `ok` 或 `fallback` 的 H 生成输出，并将该帧记录为 `status=fallback`。如果之前没有可用 H，则记录为 `status=failed`，并输出 resize 后的原始可见光图。需要严格复现旧逻辑时，可加 `--no-fallback-h`。

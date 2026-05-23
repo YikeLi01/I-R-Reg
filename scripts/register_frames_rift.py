@@ -127,6 +127,11 @@ def parse_args() -> argparse.Namespace:
         help="Overwrite existing outputs.",
     )
     parser.add_argument(
+        "--no-fallback-h",
+        action="store_true",
+        help="Disable using the last accepted homography when quality gates fail.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Show per-frame logs and RIFT internal messages.",
@@ -287,6 +292,22 @@ def write_registration_images(
         raise RuntimeError(f"Failed to write preview image: {preview_path}")
 
 
+def write_failed_or_fallback_images(
+    warped_path: Path,
+    preview_path: Path,
+    infrared: np.ndarray,
+    visible: np.ndarray,
+    fallback_homography: np.ndarray | None,
+) -> np.ndarray | None:
+    if fallback_homography is None:
+        write_registration_images(warped_path, preview_path, infrared, visible)
+        return None
+
+    warped_visible = cv2.warpPerspective(visible, fallback_homography, TARGET_SIZE)
+    write_registration_images(warped_path, preview_path, infrared, warped_visible)
+    return fallback_homography
+
+
 def flatten_homography(homography: np.ndarray | None) -> list[str]:
     if homography is None:
         return [""] * 9
@@ -373,6 +394,7 @@ def register_pair(
     min_scale: float,
     max_scale: float,
     max_translation: float,
+    fallback_homography: np.ndarray | None = None,
 ) -> RegistrationResult:
     warped_dir = output_root / "warped_rgb"
     preview_dir = output_root / "preview"
@@ -384,7 +406,11 @@ def register_pair(
 
     if warped_path.exists() and preview_path.exists() and not overwrite:
         existing_result = existing_results.get(pair.frame_id)
-        if existing_result is not None and existing_result.homography is not None:
+        if (
+            existing_result is not None
+            and existing_result.status in {"ok", "fallback"}
+            and existing_result.homography is not None
+        ):
             return existing_result
         return RegistrationResult(frame_id=pair.frame_id, status="skipped", message="outputs already exist")
 
@@ -403,12 +429,19 @@ def register_pair(
     )
 
     if len(matches) < 4:
-        write_registration_images(warped_path, preview_path, infrared, visible)
+        used_homography = write_failed_or_fallback_images(
+            warped_path,
+            preview_path,
+            infrared,
+            visible,
+            fallback_homography,
+        )
         return RegistrationResult(
             frame_id=pair.frame_id,
-            status="failed",
+            status="fallback" if used_homography is not None else "failed",
             matches=len(matches),
             message="not enough matches",
+            homography=used_homography,
         )
 
     homography, mask = cv2.findHomography(
@@ -418,12 +451,19 @@ def register_pair(
         5.0,
     )
     if homography is None or mask is None:
-        write_registration_images(warped_path, preview_path, infrared, visible)
+        used_homography = write_failed_or_fallback_images(
+            warped_path,
+            preview_path,
+            infrared,
+            visible,
+            fallback_homography,
+        )
         return RegistrationResult(
             frame_id=pair.frame_id,
-            status="failed",
+            status="fallback" if used_homography is not None else "failed",
             matches=len(matches),
             message="homography estimation failed",
+            homography=used_homography,
         )
 
     inliers = int(mask.ravel().sum())
@@ -439,14 +479,20 @@ def register_pair(
         max_translation=max_translation,
     )
     if rejection_reason is not None:
-        write_registration_images(warped_path, preview_path, infrared, visible)
+        used_homography = write_failed_or_fallback_images(
+            warped_path,
+            preview_path,
+            infrared,
+            visible,
+            fallback_homography,
+        )
         return RegistrationResult(
             frame_id=pair.frame_id,
-            status="failed",
+            status="fallback" if used_homography is not None else "failed",
             matches=len(matches),
             inliers=inliers,
             message=rejection_reason,
-            homography=homography,
+            homography=used_homography,
         )
 
     warped_visible = cv2.warpPerspective(visible, homography, TARGET_SIZE)
@@ -503,6 +549,28 @@ def sorted_results(results_by_id: dict[str, RegistrationResult]) -> list[Registr
     return [results_by_id[frame_id] for frame_id in sorted(results_by_id)]
 
 
+def last_usable_homography_before(
+    results_by_id: dict[str, RegistrationResult],
+    frame_id: str,
+) -> np.ndarray | None:
+    for existing_frame_id in sorted(results_by_id, reverse=True):
+        if existing_frame_id >= frame_id:
+            continue
+        result = results_by_id[existing_frame_id]
+        if result.status in {"ok", "fallback"} and result.homography is not None:
+            return result.homography
+    return None
+
+
+def update_last_usable_homography(
+    current: np.ndarray | None,
+    result: RegistrationResult,
+) -> np.ndarray | None:
+    if result.status in {"ok", "fallback"} and result.homography is not None:
+        return result.homography
+    return current
+
+
 def main() -> int:
     args = parse_args()
     if args.max_pairs < 0:
@@ -527,6 +595,13 @@ def main() -> int:
     existing_results = parse_existing_results(args.output_root)
     results_by_id = dict(existing_results)
     processed_results: list[RegistrationResult] = []
+    use_fallback_h = not args.no_fallback_h
+    first_frame_id = pairs[0].frame_id
+    last_usable_homography = (
+        last_usable_homography_before(results_by_id, first_frame_id)
+        if use_fallback_h
+        else None
+    )
 
     try:
         with tqdm(pairs, desc="registering", unit="pair", dynamic_ncols=True) as progress:
@@ -547,6 +622,7 @@ def main() -> int:
                         min_scale=args.min_scale,
                         max_scale=args.max_scale,
                         max_translation=args.max_translation,
+                        fallback_homography=last_usable_homography if use_fallback_h else None,
                     )
                 except Exception as exc:
                     result = RegistrationResult(
@@ -557,6 +633,11 @@ def main() -> int:
 
                 results_by_id[result.frame_id] = result
                 processed_results.append(result)
+                if use_fallback_h:
+                    last_usable_homography = update_last_usable_homography(
+                        last_usable_homography,
+                        result,
+                    )
                 write_results_csv(args.output_root, sorted_results(results_by_id))
 
                 progress.set_postfix(
@@ -580,10 +661,12 @@ def main() -> int:
         return 130
 
     ok_count = sum(result.status == "ok" for result in processed_results)
+    fallback_count = sum(result.status == "fallback" for result in processed_results)
     failed_count = sum(result.status == "failed" for result in processed_results)
     skipped_count = sum(result.status == "skipped" for result in processed_results)
     print(
-        f"done ok={ok_count} failed={failed_count} skipped={skipped_count} "
+        f"done ok={ok_count} fallback={fallback_count} failed={failed_count} "
+        f"skipped={skipped_count} "
         f"output={args.output_root}"
     )
     return 0 if failed_count == 0 else 1

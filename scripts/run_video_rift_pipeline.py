@@ -146,6 +146,11 @@ def parse_args() -> argparse.Namespace:
         help="Skip RIFT registration.",
     )
     parser.add_argument(
+        "--no-fallback-h",
+        action="store_true",
+        help="Disable using the last accepted homography when registration quality gates fail.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Pass verbose logging to the registration stage.",
@@ -294,6 +299,8 @@ def build_register_command(
     ]
     if args.overwrite:
         command.append("--overwrite")
+    if args.no_fallback_h:
+        command.append("--no-fallback-h")
     if args.verbose:
         command.append("--verbose")
     return command
