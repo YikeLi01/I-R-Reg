@@ -86,6 +86,42 @@ def parse_args() -> argparse.Namespace:
         help="Lowe ratio used for descriptor matching. Default: 0.95",
     )
     parser.add_argument(
+        "--min-inliers",
+        type=int,
+        default=50,
+        help="Minimum homography inliers required to accept registration. Default: 50",
+    )
+    parser.add_argument(
+        "--min-inlier-ratio",
+        type=float,
+        default=0.05,
+        help="Minimum inliers/matches ratio required to accept registration. Default: 0.05",
+    )
+    parser.add_argument(
+        "--max-projective",
+        type=float,
+        default=1e-3,
+        help="Maximum absolute h20/h21 projective terms for accepted H. Default: 1e-3",
+    )
+    parser.add_argument(
+        "--min-scale",
+        type=float,
+        default=0.5,
+        help="Minimum affine scale allowed for accepted H. Default: 0.5",
+    )
+    parser.add_argument(
+        "--max-scale",
+        type=float,
+        default=2.0,
+        help="Maximum affine scale allowed for accepted H. Default: 2.0",
+    )
+    parser.add_argument(
+        "--max-translation",
+        type=float,
+        default=640.0,
+        help="Maximum absolute x/y translation allowed for accepted H. Default: 640",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite existing outputs.",
@@ -235,6 +271,22 @@ def make_preview(
     return np.vstack([top, bottom])
 
 
+def write_registration_images(
+    warped_path: Path,
+    preview_path: Path,
+    infrared: np.ndarray,
+    visible_output: np.ndarray,
+) -> None:
+    overlay = make_overlay(infrared, visible_output)
+    checkerboard = make_checkerboard(infrared, visible_output)
+    preview = make_preview(infrared, visible_output, overlay, checkerboard)
+
+    if not cv2.imwrite(str(warped_path), visible_output):
+        raise RuntimeError(f"Failed to write warped image: {warped_path}")
+    if not cv2.imwrite(str(preview_path), preview):
+        raise RuntimeError(f"Failed to write preview image: {preview_path}")
+
+
 def flatten_homography(homography: np.ndarray | None) -> list[str]:
     if homography is None:
         return [""] * 9
@@ -270,6 +322,43 @@ def parse_existing_results(output_root: Path) -> dict[str, RegistrationResult]:
     return results
 
 
+def validate_homography(
+    homography: np.ndarray,
+    matches: int,
+    inliers: int,
+    min_inliers: int,
+    min_inlier_ratio: float,
+    max_projective: float,
+    min_scale: float,
+    max_scale: float,
+    max_translation: float,
+) -> str | None:
+    if inliers < min_inliers:
+        return f"low_inliers:{inliers}<{min_inliers}"
+
+    inlier_ratio = inliers / max(matches, 1)
+    if inlier_ratio < min_inlier_ratio:
+        return f"low_inlier_ratio:{inlier_ratio:.4f}<{min_inlier_ratio:.4f}"
+
+    if abs(float(homography[2, 0])) > max_projective or abs(float(homography[2, 1])) > max_projective:
+        return (
+            f"large_projective_terms:"
+            f"h20={homography[2, 0]:.6g},h21={homography[2, 1]:.6g}"
+        )
+
+    scale_x = float(np.linalg.norm(homography[0:2, 0]))
+    scale_y = float(np.linalg.norm(homography[0:2, 1]))
+    if not (min_scale <= scale_x <= max_scale and min_scale <= scale_y <= max_scale):
+        return f"scale_out_of_range:sx={scale_x:.4f},sy={scale_y:.4f}"
+
+    tx = float(homography[0, 2])
+    ty = float(homography[1, 2])
+    if abs(tx) > max_translation or abs(ty) > max_translation:
+        return f"translation_out_of_range:tx={tx:.2f},ty={ty:.2f}"
+
+    return None
+
+
 def register_pair(
     pair: FramePair,
     rift: RIFT2,
@@ -278,6 +367,12 @@ def register_pair(
     overwrite: bool,
     existing_results: dict[str, RegistrationResult],
     verbose: bool,
+    min_inliers: int,
+    min_inlier_ratio: float,
+    max_projective: float,
+    min_scale: float,
+    max_scale: float,
+    max_translation: float,
 ) -> RegistrationResult:
     warped_dir = output_root / "warped_rgb"
     preview_dir = output_root / "preview"
@@ -308,6 +403,7 @@ def register_pair(
     )
 
     if len(matches) < 4:
+        write_registration_images(warped_path, preview_path, infrared, visible)
         return RegistrationResult(
             frame_id=pair.frame_id,
             status="failed",
@@ -322,6 +418,7 @@ def register_pair(
         5.0,
     )
     if homography is None or mask is None:
+        write_registration_images(warped_path, preview_path, infrared, visible)
         return RegistrationResult(
             frame_id=pair.frame_id,
             status="failed",
@@ -330,15 +427,30 @@ def register_pair(
         )
 
     inliers = int(mask.ravel().sum())
-    warped_visible = cv2.warpPerspective(visible, homography, TARGET_SIZE)
-    overlay = make_overlay(infrared, warped_visible)
-    checkerboard = make_checkerboard(infrared, warped_visible)
-    preview = make_preview(infrared, warped_visible, overlay, checkerboard)
+    rejection_reason = validate_homography(
+        homography=homography,
+        matches=len(matches),
+        inliers=inliers,
+        min_inliers=min_inliers,
+        min_inlier_ratio=min_inlier_ratio,
+        max_projective=max_projective,
+        min_scale=min_scale,
+        max_scale=max_scale,
+        max_translation=max_translation,
+    )
+    if rejection_reason is not None:
+        write_registration_images(warped_path, preview_path, infrared, visible)
+        return RegistrationResult(
+            frame_id=pair.frame_id,
+            status="failed",
+            matches=len(matches),
+            inliers=inliers,
+            message=rejection_reason,
+            homography=homography,
+        )
 
-    if not cv2.imwrite(str(warped_path), warped_visible):
-        raise RuntimeError(f"Failed to write warped image: {warped_path}")
-    if not cv2.imwrite(str(preview_path), preview):
-        raise RuntimeError(f"Failed to write preview image: {preview_path}")
+    warped_visible = cv2.warpPerspective(visible, homography, TARGET_SIZE)
+    write_registration_images(warped_path, preview_path, infrared, warped_visible)
 
     return RegistrationResult(
         frame_id=pair.frame_id,
@@ -352,6 +464,7 @@ def register_pair(
 def write_results_csv(output_root: Path, results: list[RegistrationResult]) -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     csv_path = output_root / "homographies.csv"
+    tmp_path = output_root / "homographies.csv.tmp"
     fieldnames = [
         "frame_id",
         "status",
@@ -369,7 +482,7 @@ def write_results_csv(output_root: Path, results: list[RegistrationResult]) -> N
         "h22",
     ]
 
-    with csv_path.open("w", newline="") as file:
+    with tmp_path.open("w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(fieldnames)
         for result in results:
@@ -383,6 +496,11 @@ def write_results_csv(output_root: Path, results: list[RegistrationResult]) -> N
                     *flatten_homography(result.homography),
                 ]
             )
+    os.replace(tmp_path, csv_path)
+
+
+def sorted_results(results_by_id: dict[str, RegistrationResult]) -> list[RegistrationResult]:
+    return [results_by_id[frame_id] for frame_id in sorted(results_by_id)]
 
 
 def main() -> int:
@@ -391,49 +509,79 @@ def main() -> int:
         raise ValueError("--max-pairs must be >= 0")
     if not 0 < args.lowes_ratio <= 1:
         raise ValueError("--lowes-ratio must be in (0, 1]")
+    if args.min_inliers < 4:
+        raise ValueError("--min-inliers must be >= 4")
+    if not 0 <= args.min_inlier_ratio <= 1:
+        raise ValueError("--min-inlier-ratio must be between 0 and 1")
+    if args.max_projective <= 0:
+        raise ValueError("--max-projective must be greater than 0")
+    if args.min_scale <= 0 or args.max_scale < args.min_scale:
+        raise ValueError("--min-scale/--max-scale values are invalid")
+    if args.max_translation <= 0:
+        raise ValueError("--max-translation must be greater than 0")
 
     pairs = collect_frame_pairs(args.input_root, args.max_pairs)
     print(f"found_pairs={len(pairs)} target_size={TARGET_SIZE[0]}x{TARGET_SIZE[1]}")
 
     rift = RIFT2()
     existing_results = parse_existing_results(args.output_root)
-    results: list[RegistrationResult] = []
-    progress = tqdm(pairs, desc="registering", unit="pair", dynamic_ncols=True)
-    for pair in progress:
-        progress.set_postfix(frame=pair.frame_id, refresh=False)
-        try:
-            result = register_pair(
-                pair=pair,
-                rift=rift,
-                output_root=args.output_root,
-                lowes_ratio=args.lowes_ratio,
-                overwrite=args.overwrite,
-                existing_results=existing_results,
-                verbose=args.verbose,
-            )
-        except Exception as exc:
-            result = RegistrationResult(
-                frame_id=pair.frame_id,
-                status="failed",
-                message=str(exc),
-            )
-        results.append(result)
-        progress.set_postfix(
-            frame=result.frame_id,
-            status=result.status,
-            inliers=result.inliers,
-            refresh=False,
-        )
-        if args.verbose:
-            tqdm.write(
-                f"frame={result.frame_id} status={result.status} "
-                f"matches={result.matches} inliers={result.inliers} {result.message}"
-            )
+    results_by_id = dict(existing_results)
+    processed_results: list[RegistrationResult] = []
 
-    write_results_csv(args.output_root, results)
-    ok_count = sum(result.status == "ok" for result in results)
-    failed_count = sum(result.status == "failed" for result in results)
-    skipped_count = sum(result.status == "skipped" for result in results)
+    try:
+        with tqdm(pairs, desc="registering", unit="pair", dynamic_ncols=True) as progress:
+            for pair in progress:
+                progress.set_postfix(frame=pair.frame_id, refresh=False)
+                try:
+                    result = register_pair(
+                        pair=pair,
+                        rift=rift,
+                        output_root=args.output_root,
+                        lowes_ratio=args.lowes_ratio,
+                        overwrite=args.overwrite,
+                        existing_results=results_by_id,
+                        verbose=args.verbose,
+                        min_inliers=args.min_inliers,
+                        min_inlier_ratio=args.min_inlier_ratio,
+                        max_projective=args.max_projective,
+                        min_scale=args.min_scale,
+                        max_scale=args.max_scale,
+                        max_translation=args.max_translation,
+                    )
+                except Exception as exc:
+                    result = RegistrationResult(
+                        frame_id=pair.frame_id,
+                        status="failed",
+                        message=str(exc),
+                    )
+
+                results_by_id[result.frame_id] = result
+                processed_results.append(result)
+                write_results_csv(args.output_root, sorted_results(results_by_id))
+
+                progress.set_postfix(
+                    frame=result.frame_id,
+                    status=result.status,
+                    inliers=result.inliers,
+                    refresh=False,
+                )
+                if args.verbose:
+                    tqdm.write(
+                        f"frame={result.frame_id} status={result.status} "
+                        f"matches={result.matches} inliers={result.inliers} {result.message}"
+                    )
+    except KeyboardInterrupt:
+        write_results_csv(args.output_root, sorted_results(results_by_id))
+        print(
+            f"\ninterrupted, saved {len(processed_results)} processed result(s) "
+            f"to {args.output_root / 'homographies.csv'}",
+            file=sys.stderr,
+        )
+        return 130
+
+    ok_count = sum(result.status == "ok" for result in processed_results)
+    failed_count = sum(result.status == "failed" for result in processed_results)
+    skipped_count = sum(result.status == "skipped" for result in processed_results)
     print(
         f"done ok={ok_count} failed={failed_count} skipped={skipped_count} "
         f"output={args.output_root}"

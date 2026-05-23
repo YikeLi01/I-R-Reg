@@ -1,6 +1,6 @@
 # 红外-可见光视频配准流程
 
-本项目用于处理成对的红外视频和可见光视频。流程包括：同步抽帧、将可见光图像 resize 到红外分辨率 `640x512`、运行 RIFT 多模态配准、输出 warp 后的可见光图像和配准效果预览图。
+本项目用于处理成对的红外视频和可见光视频。流程包括：同步抽帧、基于单目标定文件去畸变、将可见光图像 resize 到红外分辨率 `640x512`、运行 RIFT 多模态配准、输出 warp 后的可见光图像和配准效果预览图。
 
 ## 目录结构准备
 
@@ -15,6 +15,9 @@ I-R-Reg/
 │       ├── frames/
 │       │   ├── infrared/
 │       │   └── visible/
+│       ├── frames_undistorted/
+│       │   ├── infrared/
+│       │   └── visible/
 │       └── rift_registration/
 │           ├── warped_rgb/
 │           ├── preview/
@@ -22,12 +25,16 @@ I-R-Reg/
 ├── RIFT-Multimodal-matching-python/
 ├── scripts/
 │   ├── extract_video_frames.py
+│   ├── undistort_extracted_frames.py
 │   ├── register_frames_rift.py
 │   └── run_video_rift_pipeline.py
+├── config/
+│   ├── ir_mono.yaml
+│   └── rgb_mono.yaml
 └── TWMM/
 ```
 
-其中 `frames/` 和 `rift_registration/` 是运行脚本后生成的目录，不需要手动创建。
+其中 `frames/`、`frames_undistorted/` 和 `rift_registration/` 是运行脚本后生成的目录，不需要手动创建。
 
 ## 使用 uv 管理环境
 
@@ -71,7 +78,7 @@ UV_CACHE_DIR=.uv-cache uv pip freeze --python .venv/bin/python > requirements.tx
 
 ## 运行总控脚本
 
-推荐使用总控脚本完成“视频抽帧 + RIFT 配准”的完整流程。
+推荐使用总控脚本完成“视频抽帧 + 去畸变 + RIFT 配准”的完整流程。
 
 先处理 1 对图片做快速验证：
 
@@ -90,10 +97,13 @@ UV_CACHE_DIR=.uv-cache uv pip freeze --python .venv/bin/python > requirements.tx
 ```bash
 --step 10                  # 每 10 帧抽取 1 张图片
 --overwrite                # 覆盖已有抽帧和配准结果，强制重新计算
---skip-extract             # 跳过抽帧，只运行配准
---skip-register            # 只抽帧，不运行配准
+--skip-extract             # 跳过抽帧，继续去畸变和配准
+--skip-register            # 只抽帧和去畸变，不运行配准
 --frames-dir PATH          # 指定抽帧输出目录
+--undistorted-frames-dir PATH # 指定去畸变输出目录
 --registration-dir PATH    # 指定配准结果输出目录
+--ir-config PATH           # 指定红外单目标定文件
+--rgb-config PATH          # 指定可见光单目标定文件
 --infrared-name FILE       # 手动指定红外视频文件名
 --visible-name FILE        # 手动指定可见光视频文件名
 ```
@@ -105,6 +115,7 @@ UV_CACHE_DIR=.uv-cache uv pip freeze --python .venv/bin/python > requirements.tx
   --infrared-name infrared.mp4 \
   --visible-name visible.mp4 \
   --frames-dir /path/to/frames \
+  --undistorted-frames-dir /path/to/frames_undistorted \
   --registration-dir /path/to/rift_output \
   --max-pairs 0
 ```
@@ -118,6 +129,13 @@ frames/infrared/infrared_000000.jpg
 frames/visible/visible_000000.jpg
 ```
 
+去畸变结果：
+
+```text
+frames_undistorted/infrared/infrared_000000.jpg
+frames_undistorted/visible/visible_000000.jpg
+```
+
 RIFT 配准结果：
 
 ```text
@@ -126,4 +144,4 @@ rift_registration/preview/preview_000000.jpg
 rift_registration/homographies.csv
 ```
 
-`warped_rgb/` 中保存的是 warp 到红外坐标系下的可见光 RGB 图像。`preview/` 中保存的是 2x2 配准效果图，包含 overlay、棋盘格、warp 后可见光图和红外原图。`homographies.csv` 记录每帧的状态、匹配点数、内点数和可见光到红外的单应性矩阵。
+总控脚本默认使用 `frames_undistorted/` 作为 RIFT 配准输入。`warped_rgb/` 中保存的是 warp 到红外坐标系下的可见光 RGB 图像。`preview/` 中保存的是 2x2 配准效果图，包含 overlay、棋盘格、warp 后可见光图和红外原图。`homographies.csv` 记录每帧的状态、匹配点数、内点数和可见光到红外的单应性矩阵。
