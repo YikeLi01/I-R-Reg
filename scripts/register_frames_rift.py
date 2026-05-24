@@ -38,6 +38,7 @@ from src.RIFT2 import RIFT2  # noqa: E402
 DEFAULT_INPUT_ROOT = Path("data/video_data_20260521/frames")
 DEFAULT_OUTPUT_ROOT = Path("data/video_data_20260521/rift_registration")
 TARGET_SIZE = (640, 512)
+MAX_INLIER_LINES = 100
 
 
 @dataclass(frozen=True)
@@ -292,6 +293,93 @@ def write_registration_images(
         raise RuntimeError(f"Failed to write preview image: {preview_path}")
 
 
+def make_inlier_matches_image(
+    infrared: np.ndarray,
+    visible: np.ndarray,
+    kp_infrared,
+    kp_visible,
+    matches: list[cv2.DMatch],
+    inlier_mask: np.ndarray | None,
+    status: str,
+    message: str,
+) -> np.ndarray:
+    canvas = np.hstack([infrared.copy(), visible.copy()])
+    height, width = infrared.shape[:2]
+
+    title = f"status={status} inliers=0 matches={len(matches)}"
+    if message:
+        title = f"{title} {message}"
+
+    if inlier_mask is not None:
+        mask_values = inlier_mask.ravel().astype(bool)
+        inlier_matches = [
+            match
+            for match, is_inlier in zip(matches, mask_values)
+            if is_inlier
+        ]
+        inlier_matches = sorted(inlier_matches, key=lambda match: match.distance)
+        inlier_matches = inlier_matches[:MAX_INLIER_LINES]
+        title = (
+            f"status={status} shown={len(inlier_matches)} "
+            f"inliers={int(mask_values.sum())} matches={len(matches)}"
+        )
+        if message:
+            title = f"{title} {message}"
+
+        for index, match in enumerate(inlier_matches):
+            x1, y1 = kp_infrared[match.queryIdx].pt
+            x2, y2 = kp_visible[match.trainIdx].pt
+            point1 = (int(round(x1)), int(round(y1)))
+            point2 = (int(round(x2)) + width, int(round(y2)))
+            color = (
+                int(37 + (index * 53) % 190),
+                int(220 - (index * 47) % 160),
+                int(60 + (index * 31) % 180),
+            )
+            cv2.line(canvas, point1, point2, color, 1, cv2.LINE_AA)
+            cv2.circle(canvas, point1, 3, color, -1, cv2.LINE_AA)
+            cv2.circle(canvas, point2, 3, color, -1, cv2.LINE_AA)
+
+    cv2.rectangle(canvas, (0, 0), (canvas.shape[1], 30), (0, 0, 0), thickness=-1)
+    cv2.putText(
+        canvas,
+        title[:150],
+        (10, 21),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.line(canvas, (width, 0), (width, height), (255, 255, 255), 1, cv2.LINE_AA)
+    return canvas
+
+
+def write_inlier_matches_image(
+    inlier_matches_path: Path,
+    infrared: np.ndarray,
+    visible: np.ndarray,
+    kp_infrared,
+    kp_visible,
+    matches: list[cv2.DMatch],
+    inlier_mask: np.ndarray | None,
+    status: str,
+    message: str,
+) -> None:
+    image = make_inlier_matches_image(
+        infrared=infrared,
+        visible=visible,
+        kp_infrared=kp_infrared,
+        kp_visible=kp_visible,
+        matches=matches,
+        inlier_mask=inlier_mask,
+        status=status,
+        message=message,
+    )
+    if not cv2.imwrite(str(inlier_matches_path), image):
+        raise RuntimeError(f"Failed to write inlier matches image: {inlier_matches_path}")
+
+
 def write_failed_or_fallback_images(
     warped_path: Path,
     preview_path: Path,
@@ -398,13 +486,21 @@ def register_pair(
 ) -> RegistrationResult:
     warped_dir = output_root / "warped_rgb"
     preview_dir = output_root / "preview"
+    inlier_matches_dir = output_root / "inlier_matches"
     warped_dir.mkdir(parents=True, exist_ok=True)
     preview_dir.mkdir(parents=True, exist_ok=True)
+    inlier_matches_dir.mkdir(parents=True, exist_ok=True)
 
     warped_path = warped_dir / f"visible_warped_{pair.frame_id}.jpg"
     preview_path = preview_dir / f"preview_{pair.frame_id}.jpg"
+    inlier_matches_path = inlier_matches_dir / f"inliers_{pair.frame_id}.jpg"
 
-    if warped_path.exists() and preview_path.exists() and not overwrite:
+    if (
+        warped_path.exists()
+        and preview_path.exists()
+        and inlier_matches_path.exists()
+        and not overwrite
+    ):
         existing_result = existing_results.get(pair.frame_id)
         if (
             existing_result is not None
@@ -436,11 +532,24 @@ def register_pair(
             visible,
             fallback_homography,
         )
+        status = "fallback" if used_homography is not None else "failed"
+        message = "not enough matches"
+        write_inlier_matches_image(
+            inlier_matches_path,
+            infrared,
+            visible,
+            kp_infrared,
+            kp_visible,
+            matches,
+            None,
+            status,
+            message,
+        )
         return RegistrationResult(
             frame_id=pair.frame_id,
-            status="fallback" if used_homography is not None else "failed",
+            status=status,
             matches=len(matches),
-            message="not enough matches",
+            message=message,
             homography=used_homography,
         )
 
@@ -458,11 +567,24 @@ def register_pair(
             visible,
             fallback_homography,
         )
+        status = "fallback" if used_homography is not None else "failed"
+        message = "homography estimation failed"
+        write_inlier_matches_image(
+            inlier_matches_path,
+            infrared,
+            visible,
+            kp_infrared,
+            kp_visible,
+            matches,
+            None,
+            status,
+            message,
+        )
         return RegistrationResult(
             frame_id=pair.frame_id,
-            status="fallback" if used_homography is not None else "failed",
+            status=status,
             matches=len(matches),
-            message="homography estimation failed",
+            message=message,
             homography=used_homography,
         )
 
@@ -486,9 +608,21 @@ def register_pair(
             visible,
             fallback_homography,
         )
+        status = "fallback" if used_homography is not None else "failed"
+        write_inlier_matches_image(
+            inlier_matches_path,
+            infrared,
+            visible,
+            kp_infrared,
+            kp_visible,
+            matches,
+            mask,
+            status,
+            rejection_reason,
+        )
         return RegistrationResult(
             frame_id=pair.frame_id,
-            status="fallback" if used_homography is not None else "failed",
+            status=status,
             matches=len(matches),
             inliers=inliers,
             message=rejection_reason,
@@ -497,6 +631,17 @@ def register_pair(
 
     warped_visible = cv2.warpPerspective(visible, homography, TARGET_SIZE)
     write_registration_images(warped_path, preview_path, infrared, warped_visible)
+    write_inlier_matches_image(
+        inlier_matches_path,
+        infrared,
+        visible,
+        kp_infrared,
+        kp_visible,
+        matches,
+        mask,
+        "ok",
+        "",
+    )
 
     return RegistrationResult(
         frame_id=pair.frame_id,

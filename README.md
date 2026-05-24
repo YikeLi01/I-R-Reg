@@ -142,9 +142,10 @@ RIFT 配准结果：
 ```text
 rift_registration/warped_rgb/visible_warped_000000.jpg
 rift_registration/preview/preview_000000.jpg
+rift_registration/inlier_matches/inliers_000000.jpg
 rift_registration/homographies.csv
 ```
 
-总控脚本默认使用 `frames_undistorted/` 作为 RIFT 配准输入。`warped_rgb/` 中保存的是 warp 到红外坐标系下的可见光 RGB 图像。`preview/` 中保存的是 2x2 配准效果图，包含 overlay、棋盘格、warp 后可见光图和红外原图。`homographies.csv` 记录每帧的状态、匹配点数、内点数和实际用于输出的可见光到红外单应性矩阵。
+总控脚本默认使用 `frames_undistorted/` 作为 RIFT 配准输入。`warped_rgb/` 中保存的是 warp 到红外坐标系下的可见光 RGB 图像。`preview/` 中保存的是 2x2 配准效果图，包含 overlay、棋盘格、warp 后可见光图和红外原图。`inlier_matches/` 中保存红外与可见光的 RIFT+RANSAC 内点连线图，默认最多显示 100 条内点连线。`homographies.csv` 记录每帧的状态、匹配点数、内点数和实际用于输出的可见光到红外单应性矩阵。
 
-配准阶段默认启用质量门控回退策略：如果当前帧匹配不足、单应性估计失败或 H 未通过质量门控，会复用当前帧之前最近一次 `ok` 或 `fallback` 的 H 生成输出，并将该帧记录为 `status=fallback`。如果之前没有可用 H，则记录为 `status=failed`，并输出 resize 后的原始可见光图。需要严格复现旧逻辑时，可加 `--no-fallback-h`。
+配准阶段默认启用质量门控回退策略：如果当前帧匹配不足、单应性估计失败或 H 未通过质量门控，会复用当前帧之前最近一次 `ok` 或 `fallback` 的 H 生成输出，并将该帧记录为 `status=fallback`。如果之前没有可用 H，则记录为 `status=failed`，并输出 resize 后的原始可见光图。`fallback` 帧的内点连线图展示的是当前帧本次 RANSAC 结果，用于诊断当前匹配质量，不代表最终用于 warp 的 fallback H。需要严格复现旧逻辑时，可加 `--no-fallback-h`。
