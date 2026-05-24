@@ -23,12 +23,10 @@ I-R-Reg/
 │           ├── preview/
 │           └── homographies.csv
 ├── RIFT-Multimodal-matching-python/
-├── RIFT2-multimodal-matching-rotation-python/
 ├── scripts/
 │   ├── extract_video_frames.py
 │   ├── undistort_extracted_frames.py
 │   ├── register_frames_rift.py
-│   ├── register_frames_rift2.py
 │   └── run_video_rift_pipeline.py
 ├── config/
 │   ├── ir_mono.yaml
@@ -94,11 +92,11 @@ UV_CACHE_DIR=.uv-cache uv pip freeze --python .venv/bin/python > requirements.tx
 .venv/bin/python scripts/run_video_rift_pipeline.py data/video_data_20260521 --max-pairs 0
 ```
 
-使用新 clone 的 RIFT2 后端处理全部帧对，结果默认写入 `rift2_registration/`：
+如果相机是固定小基线、近似平行安装，可以使用仿射模型降低几何自由度：
 
 ```bash
 .venv/bin/python scripts/run_video_rift_pipeline.py data/video_data_20260521 \
-  --register-backend rift2 \
+  --transform-model affine \
   --max-pairs 0 \
   --overwrite
 ```
@@ -110,8 +108,12 @@ UV_CACHE_DIR=.uv-cache uv pip freeze --python .venv/bin/python > requirements.tx
 --overwrite                # 覆盖已有抽帧和配准结果，强制重新计算
 --skip-extract             # 跳过抽帧，继续去畸变和配准
 --skip-register            # 只抽帧和去畸变，不运行配准
---register-backend rift2   # 使用新 RIFT2 后端；默认是 rift
+--transform-model affine   # 使用仿射模型；默认是 homography
 --no-fallback-h            # 关闭失败帧复用最近成功 H 的默认策略
+--no-temporal-gate         # 关闭连续帧 H 突变检查
+--max-corner-mean-shift 80 # 当前 H 与上一可用 H 的四角平均位移阈值
+--max-corner-max-shift 160 # 当前 H 与上一可用 H 的单角最大位移阈值
+--max-temporal-translation 80 # tx/ty 相对上一可用 H 的最大变化
 --frames-dir PATH          # 指定抽帧输出目录
 --undistorted-frames-dir PATH # 指定去畸变输出目录
 --registration-dir PATH    # 指定配准结果输出目录
@@ -169,8 +171,6 @@ rift_registration/raw_overlay/raw_overlay_000000.jpg
 rift_registration/homographies.csv
 ```
 
-RIFT2 后端输出结构相同，但默认目录是 `rift2_registration/`，便于和原 RIFT 结果对比。
+总控脚本默认使用 `frames_undistorted/` 作为配准输入。`warped_rgb/` 中保存的是 warp 到红外坐标系下的可见光 RGB 图像。`preview/` 中保存的是 2x2 配准效果图，包含 overlay、棋盘格、warp 后可见光图和红外原图。`inlier_matches/` 中保存红外与可见光的 RIFT+RANSAC 内点连线图，默认最多显示 100 条内点连线。`raw_overlay/` 中保存未配准前的红外与可见光直接叠加图，可作为配准效果对比基线。`homographies.csv` 记录每帧的状态、匹配点数、内点数和实际用于输出的可见光到红外 3x3 变换矩阵。默认 `--transform-model homography` 使用完整单应性矩阵；`--transform-model affine` 使用 6 自由度仿射矩阵并转换为 3x3 形式写入 CSV，此时 `h20=0, h21=0, h22=1`。
 
-总控脚本默认使用 `frames_undistorted/` 作为配准输入。`warped_rgb/` 中保存的是 warp 到红外坐标系下的可见光 RGB 图像。`preview/` 中保存的是 2x2 配准效果图，包含 overlay、棋盘格、warp 后可见光图和红外原图。`inlier_matches/` 中保存红外与可见光的 RIFT/RIFT2+RANSAC 内点连线图，默认最多显示 100 条内点连线。`raw_overlay/` 中保存未配准前的红外与可见光直接叠加图，可作为配准效果对比基线。`homographies.csv` 记录每帧的状态、匹配点数、内点数和实际用于输出的可见光到红外单应性矩阵。
-
-配准阶段默认启用质量门控回退策略：如果当前帧匹配不足、单应性估计失败或 H 未通过质量门控，会复用当前帧之前最近一次 `ok` 或 `fallback` 的 H 生成输出，并将该帧记录为 `status=fallback`。如果之前没有可用 H，则记录为 `status=failed`，并输出 resize 后的原始可见光图。`fallback` 帧的内点连线图展示的是当前帧本次 RANSAC 结果，用于诊断当前匹配质量，不代表最终用于 warp 的 fallback H。需要严格复现旧逻辑时，可加 `--no-fallback-h`。
+配准阶段默认启用质量门控和时序门控回退策略：如果当前帧匹配不足、单应性估计失败、H 未通过质量门控，或 H 相比最近一次可用 H 发生明显突变，会复用当前帧之前最近一次 `ok` 或 `fallback` 的 H 生成输出，并将该帧记录为 `status=fallback`。时序门控默认阈值为四角平均位移 `80px`、单角最大位移 `160px`、平移变化 `80px`、尺度比例 `[0.75, 1.33]`。如果之前没有可用 H，则记录为 `status=failed`，并输出 resize 后的原始可见光图。`fallback` 帧的内点连线图展示的是当前帧本次 RANSAC 结果，用于诊断当前匹配质量，不代表最终用于 warp 的 fallback H。需要严格复现旧逻辑时，可加 `--no-fallback-h` 或 `--no-temporal-gate`。

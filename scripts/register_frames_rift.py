@@ -39,6 +39,15 @@ DEFAULT_INPUT_ROOT = Path("data/video_data_20260521/frames")
 DEFAULT_OUTPUT_ROOT = Path("data/video_data_20260521/rift_registration")
 TARGET_SIZE = (640, 512)
 MAX_INLIER_LINES = 100
+IMAGE_CORNERS = np.array(
+    [
+        [0.0, 0.0, 1.0],
+        [TARGET_SIZE[0] - 1.0, 0.0, 1.0],
+        [TARGET_SIZE[0] - 1.0, TARGET_SIZE[1] - 1.0, 1.0],
+        [0.0, TARGET_SIZE[1] - 1.0, 1.0],
+    ],
+    dtype=np.float64,
+).T
 
 
 @dataclass(frozen=True)
@@ -87,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         help="Lowe ratio used for descriptor matching. Default: 0.95",
     )
     parser.add_argument(
+        "--transform-model",
+        choices=("homography", "affine"),
+        default="homography",
+        help="Geometric model to estimate from RIFT matches. Default: homography",
+    )
+    parser.add_argument(
         "--min-inliers",
         type=int,
         default=50,
@@ -131,6 +146,41 @@ def parse_args() -> argparse.Namespace:
         "--no-fallback-h",
         action="store_true",
         help="Disable using the last accepted homography when quality gates fail.",
+    )
+    parser.add_argument(
+        "--no-temporal-gate",
+        action="store_true",
+        help="Disable checking the current homography against the last usable homography.",
+    )
+    parser.add_argument(
+        "--max-corner-mean-shift",
+        type=float,
+        default=80.0,
+        help="Maximum mean corner displacement from the last usable H. Default: 80",
+    )
+    parser.add_argument(
+        "--max-corner-max-shift",
+        type=float,
+        default=160.0,
+        help="Maximum single-corner displacement from the last usable H. Default: 160",
+    )
+    parser.add_argument(
+        "--max-temporal-translation",
+        type=float,
+        default=80.0,
+        help="Maximum x/y translation change from the last usable H. Default: 80",
+    )
+    parser.add_argument(
+        "--min-temporal-scale-ratio",
+        type=float,
+        default=0.75,
+        help="Minimum scale ratio against the last usable H. Default: 0.75",
+    )
+    parser.add_argument(
+        "--max-temporal-scale-ratio",
+        type=float,
+        default=1.33,
+        help="Maximum scale ratio against the last usable H. Default: 1.33",
     )
     parser.add_argument(
         "--verbose",
@@ -441,6 +491,7 @@ def validate_homography(
     min_scale: float,
     max_scale: float,
     max_translation: float,
+    check_projective: bool = True,
 ) -> str | None:
     if inliers < min_inliers:
         return f"low_inliers:{inliers}<{min_inliers}"
@@ -449,7 +500,10 @@ def validate_homography(
     if inlier_ratio < min_inlier_ratio:
         return f"low_inlier_ratio:{inlier_ratio:.4f}<{min_inlier_ratio:.4f}"
 
-    if abs(float(homography[2, 0])) > max_projective or abs(float(homography[2, 1])) > max_projective:
+    if check_projective and (
+        abs(float(homography[2, 0])) > max_projective
+        or abs(float(homography[2, 1])) > max_projective
+    ):
         return (
             f"large_projective_terms:"
             f"h20={homography[2, 0]:.6g},h21={homography[2, 1]:.6g}"
@@ -468,6 +522,93 @@ def validate_homography(
     return None
 
 
+def estimate_transform(
+    points_visible: np.ndarray,
+    points_infrared: np.ndarray,
+    transform_model: str,
+) -> tuple[np.ndarray | None, np.ndarray | None, str]:
+    if transform_model == "homography":
+        homography, mask = cv2.findHomography(
+            points_visible,
+            points_infrared,
+            cv2.USAC_MAGSAC,
+            5.0,
+        )
+        return homography, mask, "homography estimation failed"
+
+    affine, mask = cv2.estimateAffine2D(
+        points_visible,
+        points_infrared,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=5.0,
+    )
+    if affine is None:
+        return None, mask, "affine estimation failed"
+
+    homography = np.eye(3, dtype=np.float64)
+    homography[:2, :] = affine
+    return homography, mask, "affine estimation failed"
+
+
+def homography_scale(homography: np.ndarray) -> tuple[float, float]:
+    return (
+        float(np.linalg.norm(homography[0:2, 0])),
+        float(np.linalg.norm(homography[0:2, 1])),
+    )
+
+
+def project_image_corners(homography: np.ndarray) -> np.ndarray:
+    projected = homography @ IMAGE_CORNERS
+    return (projected[:2] / projected[2]).T
+
+
+def validate_temporal_homography(
+    homography: np.ndarray,
+    reference_homography: np.ndarray | None,
+    max_corner_mean_shift: float,
+    max_corner_max_shift: float,
+    max_temporal_translation: float,
+    min_temporal_scale_ratio: float,
+    max_temporal_scale_ratio: float,
+) -> str | None:
+    if reference_homography is None:
+        return None
+
+    current_corners = project_image_corners(homography)
+    reference_corners = project_image_corners(reference_homography)
+    corner_shifts = np.linalg.norm(current_corners - reference_corners, axis=1)
+    mean_shift = float(corner_shifts.mean())
+    max_shift = float(corner_shifts.max())
+    if mean_shift > max_corner_mean_shift:
+        return f"temporal_jump:corner_mean_shift={mean_shift:.2f}>{max_corner_mean_shift:.2f}"
+    if max_shift > max_corner_max_shift:
+        return f"temporal_jump:corner_max_shift={max_shift:.2f}>{max_corner_max_shift:.2f}"
+
+    tx_delta = abs(float(homography[0, 2] - reference_homography[0, 2]))
+    ty_delta = abs(float(homography[1, 2] - reference_homography[1, 2]))
+    if tx_delta > max_temporal_translation or ty_delta > max_temporal_translation:
+        return (
+            f"temporal_jump:translation_delta="
+            f"tx={tx_delta:.2f},ty={ty_delta:.2f}>{max_temporal_translation:.2f}"
+        )
+
+    scale_x, scale_y = homography_scale(homography)
+    reference_scale_x, reference_scale_y = homography_scale(reference_homography)
+    scale_ratio_x = scale_x / max(reference_scale_x, 1e-12)
+    scale_ratio_y = scale_y / max(reference_scale_y, 1e-12)
+    if not (
+        min_temporal_scale_ratio <= scale_ratio_x <= max_temporal_scale_ratio
+        and min_temporal_scale_ratio <= scale_ratio_y <= max_temporal_scale_ratio
+    ):
+        return (
+            f"temporal_jump:scale_ratio="
+            f"sx={scale_ratio_x:.4f},sy={scale_ratio_y:.4f}"
+            f" not_in [{min_temporal_scale_ratio:.4f},{max_temporal_scale_ratio:.4f}]"
+        )
+
+    return None
+
+
 def register_pair(
     pair: FramePair,
     rift: RIFT2,
@@ -476,6 +617,7 @@ def register_pair(
     overwrite: bool,
     existing_results: dict[str, RegistrationResult],
     verbose: bool,
+    transform_model: str,
     min_inliers: int,
     min_inlier_ratio: float,
     max_projective: float,
@@ -483,6 +625,12 @@ def register_pair(
     max_scale: float,
     max_translation: float,
     fallback_homography: np.ndarray | None = None,
+    reference_homography: np.ndarray | None = None,
+    max_corner_mean_shift: float = 80.0,
+    max_corner_max_shift: float = 160.0,
+    max_temporal_translation: float = 80.0,
+    min_temporal_scale_ratio: float = 0.75,
+    max_temporal_scale_ratio: float = 1.33,
 ) -> RegistrationResult:
     warped_dir = output_root / "warped_rgb"
     preview_dir = output_root / "preview"
@@ -553,11 +701,10 @@ def register_pair(
             homography=used_homography,
         )
 
-    homography, mask = cv2.findHomography(
-        points_visible,
-        points_infrared,
-        cv2.USAC_MAGSAC,
-        5.0,
+    homography, mask, estimation_failure_message = estimate_transform(
+        points_visible=points_visible,
+        points_infrared=points_infrared,
+        transform_model=transform_model,
     )
     if homography is None or mask is None:
         used_homography = write_failed_or_fallback_images(
@@ -568,7 +715,7 @@ def register_pair(
             fallback_homography,
         )
         status = "fallback" if used_homography is not None else "failed"
-        message = "homography estimation failed"
+        message = estimation_failure_message
         write_inlier_matches_image(
             inlier_matches_path,
             infrared,
@@ -599,6 +746,7 @@ def register_pair(
         min_scale=min_scale,
         max_scale=max_scale,
         max_translation=max_translation,
+        check_projective=transform_model == "homography",
     )
     if rejection_reason is not None:
         used_homography = write_failed_or_fallback_images(
@@ -626,6 +774,44 @@ def register_pair(
             matches=len(matches),
             inliers=inliers,
             message=rejection_reason,
+            homography=used_homography,
+        )
+
+    temporal_rejection_reason = validate_temporal_homography(
+        homography=homography,
+        reference_homography=reference_homography,
+        max_corner_mean_shift=max_corner_mean_shift,
+        max_corner_max_shift=max_corner_max_shift,
+        max_temporal_translation=max_temporal_translation,
+        min_temporal_scale_ratio=min_temporal_scale_ratio,
+        max_temporal_scale_ratio=max_temporal_scale_ratio,
+    )
+    if temporal_rejection_reason is not None:
+        used_homography = write_failed_or_fallback_images(
+            warped_path,
+            preview_path,
+            infrared,
+            visible,
+            fallback_homography,
+        )
+        status = "fallback" if used_homography is not None else "failed"
+        write_inlier_matches_image(
+            inlier_matches_path,
+            infrared,
+            visible,
+            kp_infrared,
+            kp_visible,
+            matches,
+            mask,
+            status,
+            temporal_rejection_reason,
+        )
+        return RegistrationResult(
+            frame_id=pair.frame_id,
+            status=status,
+            matches=len(matches),
+            inliers=inliers,
+            message=temporal_rejection_reason,
             homography=used_homography,
         )
 
@@ -732,6 +918,17 @@ def main() -> int:
         raise ValueError("--min-scale/--max-scale values are invalid")
     if args.max_translation <= 0:
         raise ValueError("--max-translation must be greater than 0")
+    if args.max_corner_mean_shift <= 0:
+        raise ValueError("--max-corner-mean-shift must be greater than 0")
+    if args.max_corner_max_shift <= 0:
+        raise ValueError("--max-corner-max-shift must be greater than 0")
+    if args.max_temporal_translation <= 0:
+        raise ValueError("--max-temporal-translation must be greater than 0")
+    if (
+        args.min_temporal_scale_ratio <= 0
+        or args.max_temporal_scale_ratio < args.min_temporal_scale_ratio
+    ):
+        raise ValueError("--min-temporal-scale-ratio/--max-temporal-scale-ratio values are invalid")
 
     pairs = collect_frame_pairs(args.input_root, args.max_pairs)
     print(f"found_pairs={len(pairs)} target_size={TARGET_SIZE[0]}x{TARGET_SIZE[1]}")
@@ -741,10 +938,11 @@ def main() -> int:
     results_by_id = dict(existing_results)
     processed_results: list[RegistrationResult] = []
     use_fallback_h = not args.no_fallback_h
+    use_temporal_gate = not args.no_temporal_gate
     first_frame_id = pairs[0].frame_id
     last_usable_homography = (
         last_usable_homography_before(results_by_id, first_frame_id)
-        if use_fallback_h
+        if use_fallback_h or use_temporal_gate
         else None
     )
 
@@ -761,6 +959,7 @@ def main() -> int:
                         overwrite=args.overwrite,
                         existing_results=results_by_id,
                         verbose=args.verbose,
+                        transform_model=args.transform_model,
                         min_inliers=args.min_inliers,
                         min_inlier_ratio=args.min_inlier_ratio,
                         max_projective=args.max_projective,
@@ -768,6 +967,12 @@ def main() -> int:
                         max_scale=args.max_scale,
                         max_translation=args.max_translation,
                         fallback_homography=last_usable_homography if use_fallback_h else None,
+                        reference_homography=last_usable_homography if use_temporal_gate else None,
+                        max_corner_mean_shift=args.max_corner_mean_shift,
+                        max_corner_max_shift=args.max_corner_max_shift,
+                        max_temporal_translation=args.max_temporal_translation,
+                        min_temporal_scale_ratio=args.min_temporal_scale_ratio,
+                        max_temporal_scale_ratio=args.max_temporal_scale_ratio,
                     )
                 except Exception as exc:
                     result = RegistrationResult(
@@ -778,7 +983,7 @@ def main() -> int:
 
                 results_by_id[result.frame_id] = result
                 processed_results.append(result)
-                if use_fallback_h:
+                if use_fallback_h or use_temporal_gate:
                     last_usable_homography = update_last_usable_homography(
                         last_usable_homography,
                         result,

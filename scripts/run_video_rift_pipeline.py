@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         "--registration-dir",
         type=Path,
         default=None,
-        help="Output directory for registration. Default: <video-dir>/rift_registration or rift2_registration",
+        help="Output directory for registration. Default: <video-dir>/rift_registration",
     )
     parser.add_argument(
         "--undistorted-frames-dir",
@@ -93,6 +93,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.95,
         help="Lowe ratio used by RIFT descriptor matching. Default: 0.95",
+    )
+    parser.add_argument(
+        "--transform-model",
+        choices=("homography", "affine"),
+        default="homography",
+        help="Geometric model to estimate from RIFT matches. Default: homography",
     )
     parser.add_argument(
         "--min-inliers",
@@ -146,15 +152,44 @@ def parse_args() -> argparse.Namespace:
         help="Skip RIFT registration.",
     )
     parser.add_argument(
-        "--register-backend",
-        choices=("rift", "rift2"),
-        default="rift",
-        help="Registration backend to run. Default: rift",
-    )
-    parser.add_argument(
         "--no-fallback-h",
         action="store_true",
         help="Disable using the last accepted homography when registration quality gates fail.",
+    )
+    parser.add_argument(
+        "--no-temporal-gate",
+        action="store_true",
+        help="Disable checking each homography against the last usable homography.",
+    )
+    parser.add_argument(
+        "--max-corner-mean-shift",
+        type=float,
+        default=80.0,
+        help="Maximum mean corner displacement from the last usable H. Default: 80",
+    )
+    parser.add_argument(
+        "--max-corner-max-shift",
+        type=float,
+        default=160.0,
+        help="Maximum single-corner displacement from the last usable H. Default: 160",
+    )
+    parser.add_argument(
+        "--max-temporal-translation",
+        type=float,
+        default=80.0,
+        help="Maximum x/y translation change from the last usable H. Default: 80",
+    )
+    parser.add_argument(
+        "--min-temporal-scale-ratio",
+        type=float,
+        default=0.75,
+        help="Minimum scale ratio against the last usable H. Default: 0.75",
+    )
+    parser.add_argument(
+        "--max-temporal-scale-ratio",
+        type=float,
+        default=1.33,
+        help="Maximum scale ratio against the last usable H. Default: 1.33",
     )
     parser.add_argument(
         "--verbose",
@@ -279,14 +314,9 @@ def build_register_command(
     registration_dir: Path,
     root: Path,
 ) -> list[str]:
-    register_script = (
-        "register_frames_rift2.py"
-        if args.register_backend == "rift2"
-        else "register_frames_rift.py"
-    )
     command = [
         sys.executable,
-        str(root / "scripts" / register_script),
+        str(root / "scripts" / "register_frames_rift.py"),
         "--input-root",
         str(frames_dir),
         "--output-root",
@@ -295,6 +325,8 @@ def build_register_command(
         str(args.max_pairs),
         "--lowes-ratio",
         str(args.lowes_ratio),
+        "--transform-model",
+        args.transform_model,
         "--min-inliers",
         str(args.min_inliers),
         "--min-inlier-ratio",
@@ -307,11 +339,23 @@ def build_register_command(
         str(args.max_scale),
         "--max-translation",
         str(args.max_translation),
+        "--max-corner-mean-shift",
+        str(args.max_corner_mean_shift),
+        "--max-corner-max-shift",
+        str(args.max_corner_max_shift),
+        "--max-temporal-translation",
+        str(args.max_temporal_translation),
+        "--min-temporal-scale-ratio",
+        str(args.min_temporal_scale_ratio),
+        "--max-temporal-scale-ratio",
+        str(args.max_temporal_scale_ratio),
     ]
     if args.overwrite:
         command.append("--overwrite")
     if args.no_fallback_h:
         command.append("--no-fallback-h")
+    if args.no_temporal_gate:
+        command.append("--no-temporal-gate")
     if args.verbose:
         command.append("--verbose")
     return command
@@ -337,6 +381,17 @@ def main() -> int:
         raise ValueError("--min-scale/--max-scale values are invalid")
     if args.max_translation <= 0:
         raise ValueError("--max-translation must be greater than 0")
+    if args.max_corner_mean_shift <= 0:
+        raise ValueError("--max-corner-mean-shift must be greater than 0")
+    if args.max_corner_max_shift <= 0:
+        raise ValueError("--max-corner-max-shift must be greater than 0")
+    if args.max_temporal_translation <= 0:
+        raise ValueError("--max-temporal-translation must be greater than 0")
+    if (
+        args.min_temporal_scale_ratio <= 0
+        or args.max_temporal_scale_ratio < args.min_temporal_scale_ratio
+    ):
+        raise ValueError("--min-temporal-scale-ratio/--max-temporal-scale-ratio values are invalid")
 
     root = repo_root()
     args.video_dir = resolve_path(args.video_dir_pos or args.video_dir, root)
@@ -349,9 +404,7 @@ def main() -> int:
     registration_dir = (
         resolve_path(args.registration_dir, root)
         if args.registration_dir
-        else args.video_dir / (
-            "rift2_registration" if args.register_backend == "rift2" else "rift_registration"
-        )
+        else args.video_dir / "rift_registration"
     )
     args.ir_config = resolve_path(args.ir_config, root)
     args.rgb_config = resolve_path(args.rgb_config, root)
@@ -382,8 +435,8 @@ def main() -> int:
     print(f"visible_video={args.visible_video.name}", flush=True)
     print(f"frames_dir={frames_dir}", flush=True)
     print(f"undistorted_frames_dir={undistorted_frames_dir}", flush=True)
-    print(f"register_backend={args.register_backend}", flush=True)
     print(f"registration_dir={registration_dir}", flush=True)
+    print(f"transform_model={args.transform_model}", flush=True)
     print(f"ir_config={args.ir_config}", flush=True)
     print(f"rgb_config={args.rgb_config}", flush=True)
     print(f"step={args.step} max_pairs={args.max_pairs} overwrite={args.overwrite}", flush=True)
@@ -419,7 +472,7 @@ def main() -> int:
             run_command(
                 build_register_command(args, undistorted_frames_dir, registration_dir, root),
                 cwd=root,
-                label=f"{args.register_backend} registration",
+                label="rift registration",
             )
     except KeyboardInterrupt:
         print("\ninterrupted by user", file=sys.stderr, flush=True)
