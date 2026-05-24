@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
         "--registration-dir",
         type=Path,
         default=None,
-        help="Output directory for RIFT registration. Default: <video-dir>/rift_registration",
+        help="Output directory for registration. Default: <video-dir>/rift_registration or rift2_registration",
     )
     parser.add_argument(
         "--undistorted-frames-dir",
@@ -144,6 +144,12 @@ def parse_args() -> argparse.Namespace:
         "--skip-register",
         action="store_true",
         help="Skip RIFT registration.",
+    )
+    parser.add_argument(
+        "--register-backend",
+        choices=("rift", "rift2"),
+        default="rift",
+        help="Registration backend to run. Default: rift",
     )
     parser.add_argument(
         "--no-fallback-h",
@@ -273,9 +279,14 @@ def build_register_command(
     registration_dir: Path,
     root: Path,
 ) -> list[str]:
+    register_script = (
+        "register_frames_rift2.py"
+        if args.register_backend == "rift2"
+        else "register_frames_rift.py"
+    )
     command = [
         sys.executable,
-        str(root / "scripts" / "register_frames_rift.py"),
+        str(root / "scripts" / register_script),
         "--input-root",
         str(frames_dir),
         "--output-root",
@@ -338,7 +349,9 @@ def main() -> int:
     registration_dir = (
         resolve_path(args.registration_dir, root)
         if args.registration_dir
-        else args.video_dir / "rift_registration"
+        else args.video_dir / (
+            "rift2_registration" if args.register_backend == "rift2" else "rift_registration"
+        )
     )
     args.ir_config = resolve_path(args.ir_config, root)
     args.rgb_config = resolve_path(args.rgb_config, root)
@@ -369,6 +382,7 @@ def main() -> int:
     print(f"visible_video={args.visible_video.name}", flush=True)
     print(f"frames_dir={frames_dir}", flush=True)
     print(f"undistorted_frames_dir={undistorted_frames_dir}", flush=True)
+    print(f"register_backend={args.register_backend}", flush=True)
     print(f"registration_dir={registration_dir}", flush=True)
     print(f"ir_config={args.ir_config}", flush=True)
     print(f"rgb_config={args.rgb_config}", flush=True)
@@ -398,14 +412,14 @@ def main() -> int:
             )
 
         if args.skip_register:
-            print("\n== RIFT registration ==\nskipped by --skip-register", flush=True)
+            print("\n== registration ==\nskipped by --skip-register", flush=True)
         else:
             if not has_extracted_frames(undistorted_frames_dir):
                 raise RuntimeError(f"No undistorted frame pairs found in {undistorted_frames_dir}")
             run_command(
                 build_register_command(args, undistorted_frames_dir, registration_dir, root),
                 cwd=root,
-                label="RIFT registration",
+                label=f"{args.register_backend} registration",
             )
     except KeyboardInterrupt:
         print("\ninterrupted by user", file=sys.stderr, flush=True)
